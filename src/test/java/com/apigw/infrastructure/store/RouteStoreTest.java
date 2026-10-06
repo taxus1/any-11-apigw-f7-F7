@@ -211,4 +211,48 @@ class RouteStoreTest {
         // 没删掉
         assertNotNull(store.findByRouteNo("order-07").block());
     }
+
+    /**
+     * 题目里踩的坑：删掉一条后，它原来的条件/动作不能留无主记录；
+     * 更关键的是——拿同一编号再建一条全新路由时，老子项绝不能冒出来跟新路由混在一起。
+     *
+     * 存储是「一路由一个 JSON field、整树存整树删」，删除即 HDEL 整个 field，
+     * 新建是 HSETNX 写入一份全新 JSON，二者天然互不串。这里用黑盒用例把这条钉死。
+     */
+    @Test
+    void deleteThenRecreateSameNo_newRouteIsIndependent_noOrphanChildren() {
+        // 1) 老路由：2 条件 + 2 动作，打到 order-svc
+        store.create(route("reuse-01", 0)).block();
+
+        // 2) 删除：整树消失，编号被真正释放
+        store.delete("reuse-01", 0).block();
+        StepVerifier.create(store.findByRouteNo("reuse-01")).verifyComplete();
+        assertEquals(0L, store.findAll().count().block());
+
+        // 3) 用同一编号建一条全新路由：上游、条件、动作全部不同
+        GatewayRoute fresh = GatewayRoute.create("reuse-01", "重建路由",
+                "http://brand-new:9090", 1, "新备注");
+        fresh.setVersion(0);
+        fresh.replaceRules(
+                List.of(GatewayRule.create(null, RuleTypes.TYPE_PATH_PREFIX, null, "/fresh/", 1)),
+                List.of(GatewayRule.create(null, RuleTypes.TYPE_REQ_ADD_HEADER, "X-New", "yes", 1)));
+        GatewayRoute created = store.create(fresh).block();
+        assertEquals(0, created.getVersion(), "同号重建是一条全新路由，版本重新从 0 开始");
+
+        // 4) 读回来必须只有新路由的子项，半点老路由的影子都不能有
+        GatewayRoute got = store.findByRouteNo("reuse-01").block();
+        assertNotNull(got);
+        assertEquals("http://brand-new:9090", got.getUpstream());
+        assertEquals(1, got.getConditions().size(), "老路由的条件不能残留");
+        assertEquals(1, got.getActions().size(), "老路由的动作不能残留");
+        assertEquals("/fresh/", got.getConditions().get(0).getValue());
+        assertEquals(RuleTypes.TYPE_REQ_ADD_HEADER, got.getActions().get(0).getType());
+        assertEquals("X-New", got.getActions().get(0).getName());
+        assertEquals("yes", got.getActions().get(0).getValue());
+        // 老路由的方法条件 / 第二个动作都不应再出现
+        assertTrue(got.getConditions().stream()
+                .noneMatch(c -> RuleTypes.TYPE_METHOD.equals(c.getType())));
+        assertTrue(got.getActions().stream()
+                .noneMatch(a -> RuleTypes.TYPE_RESP_REMOVE_HEADER.equals(a.getType())));
+    }
 }

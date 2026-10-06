@@ -1,12 +1,14 @@
 package com.apigw.interfaces.rest.route;
 
 import com.apigw.application.route.GatewayRouteAppService;
+import com.apigw.application.route.RouteMatchDebugService;
 import com.apigw.common.exception.BizException;
 import com.apigw.domain.route.GatewayRoute;
 import com.apigw.domain.route.GatewayRule;
 import com.apigw.domain.route.RuleTypes;
 import com.apigw.infrastructure.store.RouteStore;
 import com.apigw.common.exception.GlobalExceptionHandler;
+import com.apigw.proxy.route.RouteSnapshot;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -14,6 +16,7 @@ import org.springframework.test.web.reactive.server.WebTestClient;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -476,5 +479,118 @@ class GatewayRouteControllerWebTest {
                 .jsonPath("$.msg").value(v ->
                         org.assertj.core.api.Assertions.assertThat(v.toString())
                                 .contains("maxAttempts"));
+    }
+
+    // ---- 落点排查接口 ----
+
+    /** 单独搭一个挂了 debug 用例（RouteCatalog 由 mock 提供快照）的客户端。 */
+    private WebTestClient debugClient(List<GatewayRoute> snapshotRoutes, long revision) {
+        var catalog = mock(com.apigw.proxy.route.RouteCatalog.class);
+        when(catalog.snapshot()).thenReturn(Mono.just(
+                new RouteSnapshot(revision, "ck", snapshotRoutes, Instant.now(), Instant.now())));
+        var debugService = new RouteMatchDebugService(catalog);
+        var app = new GatewayRouteAppService(store,
+                mock(org.springframework.context.ApplicationEventPublisher.class));
+        return WebTestClient.bindToController(new GatewayRouteController(app, debugService))
+                .controllerAdvice(new GlobalExceptionHandler())
+                .build();
+    }
+
+    private GatewayRoute matchingRoute(String no, String upstream,
+                                       List<GatewayRule> conditions) {
+        GatewayRoute r = GatewayRoute.create(no, no, upstream, 1, null);
+        r.replaceRules(conditions, List.of());
+        return r;
+    }
+
+    @Test
+    void debugMatch_reportsWinnerRankAndPerConditionReasons() {
+        GatewayRoute broad = matchingRoute("broad", "http://h:1",
+                List.of(GatewayRule.create(null, RuleTypes.TYPE_PATH_PREFIX, null, "/order/", 1)));
+        GatewayRoute specific = matchingRoute("specific", "http://h:2",
+                List.of(GatewayRule.create(null, RuleTypes.TYPE_PATH_PREFIX, null, "/order/abc/", 1),
+                        GatewayRule.create(null, RuleTypes.TYPE_METHOD, null, "GET", 2)));
+        GatewayRoute other = matchingRoute("other", "http://h:3",
+                List.of(GatewayRule.create(null, RuleTypes.TYPE_PATH_PREFIX, null, "/pay/", 1)));
+        WebTestClient client = debugClient(List.of(broad, specific, other), 7L);
+
+        Map<String, Object> body = new java.util.HashMap<>();
+        body.put("method", "get"); // 小写方法也要认
+        body.put("path", "/order/abc/x");
+        client.post().uri("/api/gateway/routes/debug/match").bodyValue(body)
+                .exchange().expectStatus().isOk().expectBody()
+                .jsonPath("$.code").isEqualTo(0)
+                .jsonPath("$.data.matchedRouteNo").isEqualTo("specific")
+                .jsonPath("$.data.snapshotRevision").isEqualTo(7)
+                // 命中两条：specific 第 1、broad 第 2（被抢）
+                .jsonPath("$.data.matchedRoutes.length()").isEqualTo(2)
+                .jsonPath("$.data.matchedRoutes[0].routeNo").isEqualTo("specific")
+                .jsonPath("$.data.matchedRoutes[0].rank").isEqualTo(1)
+                .jsonPath("$.data.matchedRoutes[1].routeNo").isEqualTo("broad")
+                .jsonPath("$.data.matchedRoutes[1].rank").isEqualTo(2)
+                .jsonPath("$.data.matchedRoutes[1].reason").value(v ->
+                        org.assertj.core.api.Assertions.assertThat(v.toString())
+                                .contains("被更靠前的路由抢走").contains("specific"))
+                // /pay 那条不命中，且给出路径不匹配原因
+                .jsonPath("$.data.unmatchedRoutes.length()").isEqualTo(1)
+                .jsonPath("$.data.unmatchedRoutes[0].routeNo").isEqualTo("other")
+                .jsonPath("$.data.unmatchedRoutes[0].conditions[0].matched").isEqualTo(false)
+                .jsonPath("$.data.summary").value(v ->
+                        org.assertj.core.api.Assertions.assertThat(v.toString()).contains("specific"));
+    }
+
+    @Test
+    void debugMatch_acceptsHeaderAndQueryFromPath() {
+        GatewayRoute r = matchingRoute("r", "http://h:1",
+                List.of(GatewayRule.create(null, RuleTypes.TYPE_HEADER, "X-Caller", "web", 1),
+                        GatewayRule.create(null, RuleTypes.TYPE_QUERY, "from", "cart", 2)));
+        WebTestClient client = debugClient(List.of(r), 1L);
+
+        // 查询串直接带在 path 里；头名小写
+        Map<String, Object> body = new java.util.HashMap<>();
+        body.put("method", "GET");
+        body.put("path", "/order/x?from=cart");
+        body.put("headers", Map.of("x-caller", "web"));
+        client.post().uri("/api/gateway/routes/debug/match").bodyValue(body)
+                .exchange().expectBody()
+                .jsonPath("$.data.matchedRouteNo").isEqualTo("r");
+
+        // 查询值不对 → 不命中，QUERY 条件给出原因
+        Map<String, Object> bad = new java.util.HashMap<>();
+        bad.put("method", "GET");
+        bad.put("path", "/order/x?from=buy");
+        bad.put("headers", Map.of("x-caller", "web"));
+        client.post().uri("/api/gateway/routes/debug/match").bodyValue(bad)
+                .exchange().expectBody()
+                .jsonPath("$.data.matchedRouteNo").doesNotExist()
+                .jsonPath("$.data.unmatchedRoutes[0].conditions[1].reason")
+                .value(v -> org.assertj.core.api.Assertions.assertThat(v.toString())
+                        .contains("查询参数不匹配"));
+    }
+
+    @Test
+    void debugMatch_queryAcceptsArrayValue() {
+        GatewayRoute r = matchingRoute("r", "http://h:1",
+                List.of(GatewayRule.create(null, RuleTypes.TYPE_QUERY, "id", "2", 1)));
+        WebTestClient client = debugClient(List.of(r), 1L);
+
+        Map<String, Object> body = new java.util.HashMap<>();
+        body.put("method", "GET");
+        body.put("path", "/x");
+        body.put("query", Map.of("id", List.of("1", "2", "3"))); // 数组形态多值
+        client.post().uri("/api/gateway/routes/debug/match").bodyValue(body)
+                .exchange().expectBody()
+                .jsonPath("$.data.matchedRouteNo").isEqualTo("r");
+    }
+
+    @Test
+    void debugMatch_missingMethod_isRejectedClearly() {
+        WebTestClient client = debugClient(List.of(), 1L);
+        client.post().uri("/api/gateway/routes/debug/match")
+                .bodyValue(Map.of("path", "/x"))
+                .exchange().expectBody()
+                .jsonPath("$.code").isEqualTo(1)
+                .jsonPath("$.msg").value(v ->
+                        org.assertj.core.api.Assertions.assertThat(v.toString()).contains("method"));
     }
 }

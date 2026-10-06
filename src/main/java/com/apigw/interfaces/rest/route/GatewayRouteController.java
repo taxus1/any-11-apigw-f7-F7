@@ -1,6 +1,7 @@
 package com.apigw.interfaces.rest.route;
 
 import com.apigw.application.route.GatewayRouteAppService;
+import com.apigw.application.route.RouteMatchDebugService;
 import com.apigw.common.Result;
 import com.apigw.domain.route.GatewayRoute;
 import com.apigw.domain.route.GatewayRule;
@@ -11,7 +12,10 @@ import com.apigw.domain.route.RetryPolicy;
 import com.apigw.infrastructure.store.dto.PageResult;
 import com.apigw.infrastructure.store.dto.RouteView;
 import com.apigw.interfaces.rest.route.vo.RouteDetailVO;
+import com.apigw.interfaces.rest.route.vo.RouteMatchDebugRequest;
+import com.apigw.interfaces.rest.route.vo.RouteMatchDebugResponse;
 import com.apigw.interfaces.rest.route.vo.RouteSaveVO;
+import com.apigw.proxy.match.SimpleMatchableRequest;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -36,9 +40,18 @@ import java.util.List;
 public class GatewayRouteController {
 
     private final GatewayRouteAppService appService;
+    private final RouteMatchDebugService debugService;
 
-    public GatewayRouteController(GatewayRouteAppService appService) {
+    @org.springframework.beans.factory.annotation.Autowired
+    public GatewayRouteController(GatewayRouteAppService appService,
+                                  RouteMatchDebugService debugService) {
         this.appService = appService;
+        this.debugService = debugService;
+    }
+
+    /** 不需要落点排查的切片测试可只传应用服务。 */
+    public GatewayRouteController(GatewayRouteAppService appService) {
+        this(appService, null);
     }
 
     /** 新建路由。 */
@@ -75,6 +88,24 @@ public class GatewayRouteController {
             @RequestParam(defaultValue = "20") int pageSize,
             @RequestParam(required = false) String keyword) {
         return appService.page(pageNum, pageSize, keyword).map(Result::ok);
+    }
+
+    /**
+     * 落点排查：给一笔请求（方法/路径/头/查询参数），算出它最终命中哪条路由，并逐条解释。
+     *
+     * 用 POST 是因为要带方法、头和查询参数这份「虚拟请求」，不适合全塞进 GET 的查询串；
+     * 它只读取当前生效快照做计算，不改任何配置。结论与真实转发同口径（同一份快照、同一套判定）。
+     */
+    @PostMapping("/debug/match")
+    public Mono<Result<RouteMatchDebugResponse>> debugMatch(@RequestBody RouteMatchDebugRequest body) {
+        java.util.Map<String, java.util.List<String>> query = new java.util.LinkedHashMap<>();
+        if (body.query() != null) {
+            body.query().forEach((k, v) -> query.put(k, RouteMatchDebugRequest.toValueList(v)));
+        }
+        var request = SimpleMatchableRequest.of(body.method(), body.path(), body.headers(), query);
+        return debugService.explain(request)
+                .map(RouteMatchDebugResponse::of)
+                .map(Result::ok);
     }
 
     /**

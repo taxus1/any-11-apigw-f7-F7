@@ -25,6 +25,7 @@ bash tools/start-echo-upstream.sh   # 本地回显上游，8091（另开一个�
 | GET | `/api/gateway/routes/{routeNo}` | 路由详情（含全部子项，按顺序号排好） |
 | GET | `/api/gateway/routes?pageNum=&pageSize=&keyword=` | 分页列表（每条带条件/动作计数） |
 | DELETE | `/api/gateway/routes/{routeNo}?expectVersion=` | 删除路由（整树清掉） |
+| POST | `/api/gateway/routes/debug/match` | 落点排查：给一笔请求算它会走哪条路由、为什么（见「落点排查」） |
 | GET | `/api/gateway/access-logs?startTime=&endTime=&routeNo=&statusCode=&pageNum=&pageSize=` | 按条件翻访问流水（时间必填，见「翻流水」） |
 
 所有接口返回统一结构 `{ code, msg, data }`：
@@ -68,6 +69,7 @@ bash tools/start-echo-upstream.sh   # 本地回显上游，8091（另开一个�
 - 顺序号每组各自从 1 开始，必须**连续、不重**。撞号会报「匹配条件第 a 条与第 b 条的顺序号撞了，都是 n」；跳号会报缺了第几。
 - 上游地址必须是合法的 `http://` / `https://` URL（协议、主机、端口都像样），空串和乱码不收。
 - 修改时把条件/动作整批重排提交即可，服务端按新一批顺序号整树替换。
+- **删除即整树删除**：一条路由连同它的全部条件、动作存在 Redis 的同一个 Hash field 里，删除是一次 `HDEL` 把整个 field 拿掉，不会留没有主记录的子项；删掉后用同一编号新建是一份从零开始的全新路由（版本回到 0、`HSETNX` 占位），老条件/动作绝不会冒出来跟新路由串。删不存在的编号返回 404，不当成功。
 
 ### 分页返回
 
@@ -118,6 +120,32 @@ bash tools/start-echo-upstream.sh   # 本地回显上游，8091（另开一个�
   2. 仍并列时条件总数更多的赢（约束更具体）；
   3. 还并列按路由编号字典序（routeNo 只含字母数字 `. _ -`）。
 - 停用的、以及一条条件都没有的路由不参与匹配。
+- 同一条路由上条件怎么排都不影响结果（AND 与顺序无关）；多条命中时选出的赢家只看上面那条静态定序，与路由在配置里的先后顺序无关，换个顺序结果一样。
+
+### 落点排查（线上自查，不用猜）
+
+拿一笔请求（方法/路径/头/查询参数）调 `POST /api/gateway/routes/debug/match`，它用的是**和转发完全相同的当前生效快照、同一套条件判定与定序**，直接算出这笔请求会落到哪条路由，并逐条解释。只读，不改配置。
+
+请求体：
+
+```json
+{
+  "method": "get",
+  "path": "/order/abc?from=cart",
+  "headers": { "x-caller": "web" },
+  "query": { "id": ["1", "2"] }
+}
+```
+
+- `method` 必填（大小写不敏感）；`path` 必填、以 `/` 开头，查询串可直接写在 `path` 里，也可放 `query`（同名以 `query` 为准）。查询参数只认 URL 查询串这一来源，不读请求体。
+- `headers` 头名大小写不敏感、头值敏感，同名头取第一个；`query` 的值可写单个字符串或字符串数组（同名多值）。
+
+返回 `data`：
+
+- `matchedRouteNo`：最终命中的路由编号；没有任何路由全部条件成立时为 `null`（转发即 404 NO_ROUTE）。
+- `matchedRoutes`：所有「全部条件成立」的路由，按定序从先到后排，带 `rank`（从 1 起）、`pathPrefixLength`、`conditionCount` 和 `reason`。`rank=1` 就是赢家；其余是「也命中、但被更靠前的抢走」的路由，`reason` 会写明被谁抢、为什么。
+- `unmatchedRoutes`：至少一条条件不成立的路由，其 `conditions` 里每条都带 `matched` 与中文 `reason`（哪条没过、实际值是什么），按编号稳定排序。
+- `snapshotRevision`：参与计算的生效快照版本号，便于和当时的热刷新版本对账；`summary` 是一句话结论。
 
 ### 动作语义
 

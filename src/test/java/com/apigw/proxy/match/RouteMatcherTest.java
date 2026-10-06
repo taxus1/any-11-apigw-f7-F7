@@ -142,6 +142,30 @@ class RouteMatcherTest {
     }
 
     @Test
+    void conditionOrderOnSameRouteDoesNotChangeResult() {
+        // 同一条路由上 4 类条件，正序/乱序两份配置；同样的请求要么都命中、要么都不命中
+        List<GatewayRule> ordered = List.of(
+                path("/order/", 1), method("GET", 2),
+                header("X-Caller", "web", 3), query("from", "cart", 4));
+        List<GatewayRule> shuffled = List.of(
+                query("from", "cart", 1), header("X-Caller", "web", 2),
+                method("GET", 3), path("/order/", 4));
+        GatewayRoute a = route("r", "http://h:1", ordered);
+        GatewayRoute b = route("r", "http://h:1", shuffled);
+
+        var ok = MockServerHttpRequest.get("/order/abc?from=cart")
+                .header("x-caller", "web").build();
+        assertEquals("r", matcher.match(List.of(a), ok).getRouteNo());
+        assertEquals("r", matcher.match(List.of(b), ok).getRouteNo());
+
+        // 有一条不成立（查询值不对）时，两种顺序都必须不命中
+        var bad = MockServerHttpRequest.get("/order/abc?from=buy")
+                .header("x-caller", "web").build();
+        assertNull(matcher.match(List.of(a), bad));
+        assertNull(matcher.match(List.of(b), bad));
+    }
+
+    @Test
     void disabledAndConditionlessRoutesAreFilteredByCatalog_notByMatcher() {
         // 匹配器只负责对给它的快照做判断；停用/无条件路由是否进入快照是 RouteCatalog 的口径。
         // 这里确认：给它就匹（match 本身不做启用过滤），口径在 catalog 测试里验证。
