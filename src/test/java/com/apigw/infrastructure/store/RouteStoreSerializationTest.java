@@ -69,4 +69,54 @@ class RouteStoreSerializationTest {
         assertThat(back.hasGrayGroups()).isFalse();
         assertThat(back.getGrayGroups()).isEmpty();
     }
+
+    @Test
+    void resilience_roundTripsThroughJson() {
+        GatewayRoute r = GatewayRoute.create("res-01", "韧性路由", "http://svc:8080", 1, null);
+        var policy = new com.apigw.domain.route.ResiliencePolicy();
+        policy.setCircuitBreakerEnabled(1);
+        var cb = new com.apigw.domain.route.CircuitBreakerPolicy();
+        cb.setWindowSize(30);
+        cb.setMinFailureCount(8);
+        cb.setFailureRateThreshold(60);
+        cb.setMinimumNumberOfCalls(10);
+        cb.setOpenWaitMs(5_000L);
+        cb.setTrialFraction(20);
+        cb.setSuccessThreshold(2);
+        policy.setCircuitBreaker(cb);
+        policy.setRetryEnabled(1);
+        var rt = new com.apigw.domain.route.RetryPolicy();
+        rt.setMaxAttempts(3);
+        rt.setBackoffMs(150L);
+        rt.setTotalTimeoutMs(8_000L);
+        rt.setIdempotentMethods(java.util.List.of("PUT", "DELETE"));
+        rt.setIdempotencyKeyHeader("Idempotency-Key");
+        policy.setRetry(rt);
+        r.replaceResilience(policy);
+
+        String json = store.serialize(r);
+        assertThat(json).contains("\"resilience\"").contains("\"circuitBreakerEnabled\":1")
+                .contains("\"retryEnabled\":1").contains("Idempotency-Key");
+
+        GatewayRoute back = store.deserialize(json);
+        assertThat(back.circuitBreakerPolicy()).isNotNull();
+        assertThat(back.circuitBreakerPolicy().getWindowSize()).isEqualTo(30);
+        assertThat(back.circuitBreakerPolicy().getTrialFraction()).isEqualTo(20);
+        assertThat(back.retryPolicy()).isNotNull();
+        assertThat(back.retryPolicy().getMaxAttempts()).isEqualTo(3);
+        assertThat(back.retryPolicy().getIdempotentMethods()).containsExactly("PUT", "DELETE");
+        // 带幂等键的 POST 在往返后仍可重试
+        assertThat(back.retryPolicy().isRetryable("POST", true)).isTrue();
+        assertThat(back.retryPolicy().isRetryable("POST", false)).isFalse();
+    }
+
+    @Test
+    void legacyJsonWithoutResilience_defaultsToBothOff() {
+        String legacy = "{\"id\":\"id-1\",\"routeNo\":\"legacy\",\"name\":\"旧路由\","
+                + "\"upstream\":\"http://svc:8080\",\"enabled\":1,\"authRequired\":0,\"version\":3,"
+                + "\"conditions\":[],\"actions\":[]}";
+        GatewayRoute back = store.deserialize(legacy);
+        assertThat(back.circuitBreakerPolicy()).isNull();
+        assertThat(back.retryPolicy()).isNull();
+    }
 }

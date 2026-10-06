@@ -83,8 +83,14 @@ class UserAuthProxyFilterTest {
         WebClient webClient = WebClient.builder()
                 .clientConnector(new org.springframework.http.client.reactive.ReactorClientHttpConnector(nettyClient))
                 .build();
+        UpstreamForwarder upstreamForwarder = new UpstreamForwarder(webClient);
         var filter = new GatewayProxyWebFilter(
-                catalog, new RouteMatcher(), new UpstreamForwarder(webClient),
+                catalog, new RouteMatcher(), upstreamForwarder,
+                new com.apigw.proxy.resilience.ResilientForwarder(
+                        upstreamForwarder,
+                        new com.apigw.proxy.resilience.CircuitBreakerRegistry(),
+                        new com.apigw.proxy.config.ResilienceProperties(
+                                1024 * 1024L, 2 * 1024 * 1024L, 5)),
                 new AccessLogRecorder(), e -> { }, new ObjectMapper(), gatekeeper,
                 new com.apigw.proxy.gray.GrayReleaseSelector(
                         new com.apigw.proxy.gray.GrayProperties(null)));

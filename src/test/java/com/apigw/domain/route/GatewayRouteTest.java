@@ -7,6 +7,8 @@ import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -248,5 +250,55 @@ class GatewayRouteTest {
                 List.of());
         assertEquals(2, r.getConditions().size());
         assertEquals("/pay/", r.getConditions().get(0).getValue());
+    }
+
+    // ---- 韧性（熔断/重试）随聚合校验 ----
+
+    @Test
+    void resilience_absent_meansBothOff() {
+        GatewayRoute r = base();
+        r.replaceResilience(null);
+        assertNull(r.circuitBreakerPolicy());
+        assertNull(r.retryPolicy());
+    }
+
+    @Test
+    void resilience_eachSwitchIndependent() {
+        GatewayRoute r = base();
+        var p = new ResiliencePolicy();
+        p.setCircuitBreakerEnabled(1);
+        p.setCircuitBreaker(new CircuitBreakerPolicy());
+        p.setRetryEnabled(0);
+        r.replaceResilience(p);
+        assertNotNull(r.circuitBreakerPolicy());
+        assertNull(r.retryPolicy());
+
+        var p2 = new ResiliencePolicy();
+        p2.setCircuitBreakerEnabled(0);
+        p2.setRetryEnabled(1);
+        p2.setRetry(new RetryPolicy());
+        r.replaceResilience(p2);
+        assertNull(r.circuitBreakerPolicy());
+        assertNotNull(r.retryPolicy());
+    }
+
+    @Test
+    void resilience_rejectsIllegalSwitchValue() {
+        GatewayRoute r = base();
+        var p = new ResiliencePolicy();
+        p.setCircuitBreakerEnabled(2);
+        BizException e = assertThrows(BizException.class, () -> r.replaceResilience(p));
+        assertTrue(e.getMessage().contains("熔断开关"), e.getMessage());
+    }
+
+    @Test
+    void resilience_enabledWithGarbageParams_isValidated() {
+        GatewayRoute r = base();
+        var p = new ResiliencePolicy();
+        p.setRetryEnabled(1);
+        var rt = new RetryPolicy();
+        rt.setMaxAttempts(0); // 非法
+        p.setRetry(rt);
+        assertThrows(BizException.class, () -> r.replaceResilience(p));
     }
 }

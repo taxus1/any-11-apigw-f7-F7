@@ -65,9 +65,15 @@ class GatewayCorsWebFilterTest {
         var webClient = WebClient.builder()
                 .clientConnector(new org.springframework.http.client.reactive.ReactorClientHttpConnector(nettyClient))
                 .build();
+        var upstreamForwarder = new com.apigw.proxy.forward.UpstreamForwarder(webClient);
         var proxyFilter = new GatewayProxyWebFilter(
                 catalog, new RouteMatcher(),
-                new com.apigw.proxy.forward.UpstreamForwarder(webClient),
+                upstreamForwarder,
+                new com.apigw.proxy.resilience.ResilientForwarder(
+                        upstreamForwarder,
+                        new com.apigw.proxy.resilience.CircuitBreakerRegistry(),
+                        new com.apigw.proxy.config.ResilienceProperties(
+                                1024 * 1024L, 2 * 1024 * 1024L, 5)),
                 new AccessLogRecorder(), e -> { }, new ObjectMapper(),
                 // 配上验签器，受保护路由缺令牌时才会走 401（而不是配置缺失的 503）
                 new UserAuthGatekeeper(

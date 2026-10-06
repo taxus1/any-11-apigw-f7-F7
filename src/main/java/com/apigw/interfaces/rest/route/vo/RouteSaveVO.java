@@ -19,7 +19,8 @@ public record RouteSaveVO(String routeNo,
                           Integer version,
                           List<RuleVO> conditions,
                           List<RuleVO> actions,
-                          List<GrayGroupVO> grayGroups) implements Serializable {
+                          List<GrayGroupVO> grayGroups,
+                          ResilienceVO resilience) implements Serializable {
 
     public record RuleVO(String stage,
                          String type,
@@ -37,5 +38,31 @@ public record RouteSaveVO(String routeNo,
                               String upstream,
                               Integer weight,
                               List<String> tags) implements Serializable {
+    }
+
+    /**
+     * 韧性配置：熔断、重试各自独立开关（1 开 / 0 关，缺省 0），整块不传 = 两者都不开。
+     * 子项只传想配的，其余在领域层取默认值。
+     */
+    public record ResilienceVO(Integer circuitBreakerEnabled,
+                               CircuitBreakerVO circuitBreaker,
+                               Integer retryEnabled,
+                               RetryVO retry) implements Serializable {
+    }
+
+    public record CircuitBreakerVO(Integer windowSize,
+                                   Integer minimumNumberOfCalls,
+                                   Integer failureRateThreshold,
+                                   Integer minFailureCount,
+                                   Long openWaitMs,
+                                   Integer trialFraction,
+                                   Integer successThreshold) implements Serializable {
+    }
+
+    public record RetryVO(Integer maxAttempts,
+                          Long backoffMs,
+                          Long totalTimeoutMs,
+                          List<String> idempotentMethods,
+                          String idempotencyKeyHeader) implements Serializable {
     }
 }

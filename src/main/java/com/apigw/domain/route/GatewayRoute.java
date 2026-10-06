@@ -67,6 +67,12 @@ public class GatewayRoute {
      */
     private List<GrayGroup> grayGroups = new ArrayList<>();
 
+    /**
+     * 韧性策略（熔断 + 重试，各自独立开关）。null 表示这条路由两者都不配：
+     * 旧配置 JSON 反序列化、或没用到这功能的路由都落 null，转发链路行为与以前完全一致。
+     */
+    private ResiliencePolicy resilience;
+
     public static GatewayRoute create(String routeNo, String name, String upstream,
                                       Integer enabled, String remark) {
         GatewayRoute route = new GatewayRoute();
@@ -238,5 +244,29 @@ public class GatewayRoute {
     /** 是否配了灰度分组；没配时所有请求都打主上游，灰度逻辑完全不介入。 */
     public boolean hasGrayGroups() {
         return grayGroups != null && !grayGroups.isEmpty();
+    }
+
+    /**
+     * 替换韧性策略（熔断/重试）。传 null = 两者都不开，转发走老链路。
+     * 开关与参数全部在 {@link ResiliencePolicy#normalizeAndValidate()} 内校验归一。
+     */
+    public void replaceResilience(ResiliencePolicy policy) {
+        if (policy == null) {
+            this.resilience = null;
+            return;
+        }
+        policy.normalizeAndValidate();
+        this.resilience = policy;
+    }
+
+    /** 熔断策略；没配或没开返回 null（调用方据此完全不介入）。 */
+    public CircuitBreakerPolicy circuitBreakerPolicy() {
+        return resilience != null && resilience.circuitBreakerOn()
+                ? resilience.getCircuitBreaker() : null;
+    }
+
+    /** 重试策略；没配或没开返回 null（调用方据此完全不介入）。 */
+    public RetryPolicy retryPolicy() {
+        return resilience != null && resilience.retryOn() ? resilience.getRetry() : null;
     }
 }

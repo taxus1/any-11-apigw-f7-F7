@@ -25,6 +25,11 @@ class FakeUpstream implements AutoCloseable {
     private volatile int responseStatus = 200;
     private volatile String customBody;
     private volatile boolean hangForever;
+    /** 每次请求自增的命中次数（重试会打多发，用它断言到底打了上游几次）。 */
+    private final java.util.concurrent.atomic.AtomicInteger hitCount =
+            new java.util.concurrent.atomic.AtomicInteger();
+    /** 可选：按「第几次命中」脚本化状态码（1 起）；命中次数超出列表后回落 responseStatus。 */
+    private volatile java.util.List<Integer> scriptedStatuses = java.util.List.of();
 
     FakeUpstream() throws IOException {
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
@@ -62,8 +67,18 @@ class FakeUpstream implements AutoCloseable {
         this.hangForever = hang;
     }
 
+    int hitCount() {
+        return hitCount.get();
+    }
+
+    /** 按命中次序脚本化状态码：如 [500,500,200] 表示前两次 500、第三次起 200。 */
+    void scriptStatuses(Integer... statuses) {
+        this.scriptedStatuses = java.util.List.of(statuses);
+    }
+
     private void handle(HttpExchange exchange) {
         lastExchange.set(exchange);
+        int hit = hitCount.incrementAndGet();
         if (hangForever) {
             // 读到请求后永不响应，逼网关走响应超时分支；可中断，close 时会被打断
             Thread t = Thread.currentThread();
@@ -91,8 +106,11 @@ class FakeUpstream implements AutoCloseable {
                                     ? "" : exchange.getRequestURI().getRawQuery())
                             + "\",\"headers\":{" + headers + "}}";
             byte[] out = body.getBytes(StandardCharsets.UTF_8);
+            int status = scriptedStatuses.isEmpty() ? responseStatus
+                    : (hit <= scriptedStatuses.size()
+                            ? scriptedStatuses.get(hit - 1) : responseStatus);
             exchange.getResponseHeaders().add("Content-Type", "application/json");
-            exchange.sendResponseHeaders(responseStatus, out.length);
+            exchange.sendResponseHeaders(status, out.length);
             try (OutputStream os = exchange.getResponseBody()) {
                 os.write(out);
             }

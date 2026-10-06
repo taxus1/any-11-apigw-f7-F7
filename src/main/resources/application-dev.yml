@@ -33,6 +33,13 @@ apigw:
     route-refresh-interval: 10s
     # 兜底轮询周期（毫秒），与上面的 Duration 保持一致；@Scheduled 只吃 long/字符串
     route-refresh-interval-ms: 1000
+  # 熔断/重试的资源保护硬边界（按路由的门槛、次数、间隔在每条路由的 resilience 配置里）。
+  # 可重试请求的请求体最多缓存 1MiB 用于重放（超过则该笔自动放弃重试、退回单发，不缓冲大请求体）；
+  # 上游 5xx 错误体最多缓存 2MiB 用于判定/兜底；无论路由怎么配，单笔最多打 5 发（含首发）。
+  resilience:
+    retryable-request-body-cap-bytes: 1048576
+    retryable-response-body-cap-bytes: 2097152
+    max-attempts-hard-cap: 5
     route:
       enabled: ${ROUTE_COORDINATION_ENABLED:false}
       expected-instances: ${ROUTE_EXPECTED_INSTANCES:1}

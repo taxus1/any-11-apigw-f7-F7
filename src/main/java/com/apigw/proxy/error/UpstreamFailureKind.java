@@ -63,6 +63,13 @@ public enum UpstreamFailureKind {
             "上游服务响应超时，网关未在规定时间内拿到响应"),
     CONFIG_UNAVAILABLE(HttpStatus.SERVICE_UNAVAILABLE, "CONFIG_UNAVAILABLE",
             "网关路由配置暂时不可用，请稍后重试"),
+    /**
+     * 熔断器打开：本网关这台观察到该上游连续失败到门槛，正在让它歇着，
+     * 请求根本没打上游就被快速拒绝（503，配 Retry-After）。这是网关主动保护，
+     * 不是上游实时返回的结果——与真正连不上的 502、超时的 504 区分开。
+     */
+    UPSTREAM_CIRCUIT_OPEN(HttpStatus.SERVICE_UNAVAILABLE, "UPSTREAM_CIRCUIT_OPEN",
+            "上游正在熔断保护中（近期连续失败），网关暂不转发，请稍后重试"),
     UPSTREAM_PROTOCOL_ERROR(HttpStatus.BAD_GATEWAY, "UPSTREAM_PROTOCOL_ERROR",
             "上游返回了无法处理的响应，网关未能完成转发");
 

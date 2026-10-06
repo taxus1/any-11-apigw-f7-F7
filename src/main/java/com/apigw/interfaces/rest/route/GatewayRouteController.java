@@ -5,6 +5,9 @@ import com.apigw.common.Result;
 import com.apigw.domain.route.GatewayRoute;
 import com.apigw.domain.route.GatewayRule;
 import com.apigw.domain.route.GrayGroup;
+import com.apigw.domain.route.CircuitBreakerPolicy;
+import com.apigw.domain.route.ResiliencePolicy;
+import com.apigw.domain.route.RetryPolicy;
 import com.apigw.infrastructure.store.dto.PageResult;
 import com.apigw.infrastructure.store.dto.RouteView;
 import com.apigw.interfaces.rest.route.vo.RouteDetailVO;
@@ -94,7 +97,7 @@ public class GatewayRouteController {
                 : body.grayGroups().stream().map(GatewayRouteController::toGrayGroup).toList();
         return appService.assemble(body.routeNo(), body.name(), body.upstream(),
                 body.enabled(), body.authRequired(), body.remark(), body.version(),
-                conditions, actions, groups);
+                conditions, actions, groups, toResilience(body.resilience()));
     }
 
     private static GatewayRule toRule(RouteSaveVO.RuleVO vo) {
@@ -103,5 +106,38 @@ public class GatewayRouteController {
 
     private static GrayGroup toGrayGroup(RouteSaveVO.GrayGroupVO vo) {
         return GrayGroup.create(vo.groupName(), vo.upstream(), vo.weight(), vo.tags());
+    }
+
+    private static ResiliencePolicy toResilience(RouteSaveVO.ResilienceVO vo) {
+        if (vo == null) {
+            return null;
+        }
+        ResiliencePolicy p = new ResiliencePolicy();
+        p.setCircuitBreakerEnabled(vo.circuitBreakerEnabled());
+        p.setRetryEnabled(vo.retryEnabled());
+        if (vo.circuitBreaker() != null) {
+            var c = vo.circuitBreaker();
+            var cb = new CircuitBreakerPolicy();
+            cb.setWindowSize(c.windowSize());
+            cb.setMinimumNumberOfCalls(c.minimumNumberOfCalls());
+            cb.setFailureRateThreshold(c.failureRateThreshold());
+            cb.setMinFailureCount(c.minFailureCount());
+            cb.setOpenWaitMs(c.openWaitMs());
+            cb.setTrialFraction(c.trialFraction());
+            cb.setSuccessThreshold(c.successThreshold());
+            p.setCircuitBreaker(cb);
+        }
+        if (vo.retry() != null) {
+            var r = vo.retry();
+            var rt = new RetryPolicy();
+            rt.setMaxAttempts(r.maxAttempts());
+            rt.setBackoffMs(r.backoffMs());
+            rt.setTotalTimeoutMs(r.totalTimeoutMs());
+            rt.setIdempotentMethods(r.idempotentMethods() == null
+                    ? new java.util.ArrayList<>() : new java.util.ArrayList<>(r.idempotentMethods()));
+            rt.setIdempotencyKeyHeader(r.idempotencyKeyHeader());
+            p.setRetry(rt);
+        }
+        return p;
     }
 }

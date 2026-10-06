@@ -4,6 +4,7 @@ import com.apigw.common.exception.BizException;
 import com.apigw.domain.route.GatewayRoute;
 import com.apigw.domain.route.GatewayRule;
 import com.apigw.domain.route.GrayGroup;
+import com.apigw.domain.route.ResiliencePolicy;
 import com.apigw.infrastructure.store.RouteStore;
 import com.apigw.infrastructure.store.dto.PageResult;
 import com.apigw.infrastructure.store.dto.RouteView;
@@ -111,7 +112,7 @@ public class GatewayRouteAppService {
     public GatewayRoute assemble(String routeNo, String name, String upstream, Integer enabled,
                                  Integer authRequired, String remark, Integer version,
                                  List<GatewayRule> conditions, List<GatewayRule> actions,
-                                 List<GrayGroup> grayGroups) {
+                                 List<GrayGroup> grayGroups, ResiliencePolicy resilience) {
         GatewayRoute route = GatewayRoute.create(routeNo, name, upstream, enabled, remark);
         route.changeAuthRequired(authRequired);
         // version 原样带入：修改时必须等于当前版本；为空会在 store 被拒
@@ -119,6 +120,8 @@ public class GatewayRouteAppService {
         route.replaceRules(conditions, actions);
         // 灰度分组：null/空 = 不做灰度；非空走聚合的整组校验（权重和必须恰好为 100）
         route.replaceGrayGroups(grayGroups);
+        // 韧性策略：null = 熔断/重试都不开；非空走聚合的开关与参数校验
+        route.replaceResilience(resilience);
         return route;
     }
 }

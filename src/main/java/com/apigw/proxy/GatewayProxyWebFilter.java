@@ -15,10 +15,13 @@ import com.apigw.proxy.forward.UpstreamResponse;
 import com.apigw.proxy.gray.GrayReleaseSelector;
 import com.apigw.proxy.gray.GrayTarget;
 import com.apigw.proxy.match.RouteMatcher;
+import com.apigw.proxy.resilience.ResilientForwarder;
 import com.apigw.proxy.route.RouteCatalog;
 import com.apigw.proxy.route.RouteSnapshot;
 import com.apigw.proxy.userauth.OutboundAuth;
 import com.apigw.proxy.userauth.UserAuthGatekeeper;
+import com.apigw.domain.route.CircuitBreakerPolicy;
+import com.apigw.domain.route.RetryPolicy;
 import com.apigw.domain.userauth.UserTokenVerifier;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
@@ -30,12 +33,14 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.server.ServerWebExchange;
 import org.springframework.web.server.WebFilter;
 import org.springframework.web.server.WebFilterChain;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 import java.net.URI;
 import java.time.Instant;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -81,6 +86,7 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
     private final RouteCatalog routeCatalog;
     private final RouteMatcher routeMatcher;
     private final UpstreamForwarder forwarder;
+    private final ResilientForwarder resilientForwarder;
     private final AccessLogRecorder accessLog;
     private final AccessLogSink accessLogSink;
     private final ObjectMapper objectMapper;
@@ -90,6 +96,7 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
     public GatewayProxyWebFilter(RouteCatalog routeCatalog,
                                  RouteMatcher routeMatcher,
                                  UpstreamForwarder forwarder,
+                                 ResilientForwarder resilientForwarder,
                                  AccessLogRecorder accessLog,
                                  AccessLogSink accessLogSink,
                                  ObjectMapper objectMapper,
@@ -98,6 +105,7 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
         this.routeCatalog = routeCatalog;
         this.routeMatcher = routeMatcher;
         this.forwarder = forwarder;
+        this.resilientForwarder = resilientForwarder;
         this.accessLog = accessLog;
         this.accessLogSink = accessLogSink;
         this.objectMapper = objectMapper;
@@ -198,17 +206,35 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
                             targetUpstream, exchange.getRequest());
                     OutboundAuth outboundAuth = userAuth.outbound(
                             traceId, exchange.getRequest(), identity);
-                    // 响应处理必须在 WebClient 的 exchangeToMono 回调内完成（此时仍持有上游连接），
-                    // 所以把 writeUpstreamResponse 作为 handler 传进去
-                    return forwarder.forward(route, exchange.getRequest(), traceId, targetUri,
-                            outboundAuth,
-                            upstream -> writeUpstreamResponse(exchange, route, upstream))
-                            .onErrorResume(err -> {
-                                UpstreamFailureKind kind = UpstreamFailureKind.classify(err);
-                                outcome.set(new Outcome(route.getRouteNo(), targetUpstream,
-                                        kind.errorCode(), groupName));
-                                return fail(exchange, traceId, kind, err);
-                            });
+
+                    // 韧性策略各路由独立：没配的一侧返回 null，对应能力完全不介入。
+                    CircuitBreakerPolicy cbPolicy = route.circuitBreakerPolicy();
+                    RetryPolicy routeRetry = route.retryPolicy();
+                    // 重试资格按「方法 + 内部幂等键约定」逐请求判定，绝不看路径像不像
+                    // （/order/query 不会因名字被重试；带约定幂等键的 POST 才允许重试）
+                    RetryPolicy effectiveRetry = resolveEffectiveRetry(routeRetry, exchange.getRequest());
+
+                    // 熔断/重试任一开启才走韧性编排；都没开走老的单发流式链路（零变化）
+                    boolean resilienceOn = cbPolicy != null || effectiveRetry != null;
+                    if (!resilienceOn) {
+                        return forwarder.forward(route, exchange.getRequest(), traceId, targetUri,
+                                        outboundAuth,
+                                        upstream -> writeUpstreamResponse(exchange, route, upstream))
+                                .onErrorResume(err -> {
+                                    UpstreamFailureKind kind = UpstreamFailureKind.classify(err);
+                                    outcome.set(new Outcome(route.getRouteNo(), targetUpstream,
+                                            kind.errorCode(), groupName));
+                                    return fail(exchange, traceId, kind, err);
+                                });
+                    }
+
+                    return resilientForwarder.execute(
+                                    route.getRouteNo(), exchange.getRequest(), traceId,
+                                    targetUpstream, targetUri, route, outboundAuth,
+                                    cbPolicy, effectiveRetry,
+                                    upstream -> writeUpstreamResponse(exchange, route, upstream))
+                            .flatMap(res -> handleResilienceOutcome(exchange, route, targetUpstream,
+                                    groupName, traceId, res, outcome));
                 })
                 // 路由目录给不出可用配置（Redis 故障且没有旧快照）：这是网关侧故障，不是没配路由
                 .onErrorResume(err -> {
@@ -271,6 +297,67 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
             return Mono.empty();
         });
         return response.writeWith(upstream.body().map(b -> (DataBuffer) b));
+    }
+
+    /**
+     * 逐请求判定重试资格：只看「方法 + 内部幂等键约定」，不看路径。
+     * 路由没开重试返回 null；开了但这笔请求按约定不可重试（如无幂等键的 POST 下单/支付）也返回 null。
+     */
+    private RetryPolicy resolveEffectiveRetry(RetryPolicy routeRetry,
+                                              org.springframework.http.server.reactive.ServerHttpRequest request) {
+        if (routeRetry == null) {
+            return null;
+        }
+        String method = request.getMethod() == null ? "" : request.getMethod().name();
+        boolean hasIdempotencyKey = routeRetry.getIdempotencyKeyHeader() != null
+                && isPresentHeader(request, routeRetry.getIdempotencyKeyHeader());
+        return routeRetry.isRetryable(method, hasIdempotencyKey) ? routeRetry : null;
+    }
+
+    private boolean isPresentHeader(org.springframework.http.server.reactive.ServerHttpRequest request,
+                                    String name) {
+        String v = request.getHeaders().getFirst(name);
+        return v != null && !v.isBlank();
+    }
+
+    /**
+     * 韧性编排终局 → 调用方答复与访问流水结果：
+     * - Completed：成功（2xx/3xx/4xx）已就地流式写回，什么都不用再做；
+     * - UpstreamFailureResponse：重试耗尽后兜底的真实 5xx，按上游原样写回一次；
+     * - Failed：始终没拿到可用响应，合成 502/504；
+     * - CircuitOpen：熔断 OPEN 快速拒绝（请求没打上游，也绝不重试），回 503 + Retry-After。
+     */
+    private Mono<Void> handleResilienceOutcome(ServerWebExchange exchange, GatewayRoute route,
+                                               String targetUpstream, String groupName,
+                                               String traceId,
+                                               com.apigw.proxy.resilience.ResilientForwarder.Outcome res,
+                                               AtomicReference<Outcome> outcome) {
+        if (res instanceof com.apigw.proxy.resilience.ResilientForwarder.Outcome.Completed) {
+            // 成功/4xx 已就地写回，状态码由 doFinally 从响应上取
+            return Mono.empty();
+        }
+        if (res instanceof com.apigw.proxy.resilience.ResilientForwarder.Outcome.UpstreamFailureResponse uf) {
+            // 重试耗尽：把最后一次的真实上游 5xx 原样交回调用方（状态码/头/体），状态码即结果
+            UpstreamResponse buffered = new UpstreamResponse(uf.statusCode(), uf.headers(),
+                    Flux.just(exchange.getResponse().bufferFactory().wrap(uf.body().bytes())));
+            outcome.set(new Outcome(route.getRouteNo(), targetUpstream,
+                    "UPSTREAM_" + uf.statusCode(), groupName));
+            return writeUpstreamResponse(exchange, route, buffered);
+        }
+        if (res instanceof com.apigw.proxy.resilience.ResilientForwarder.Outcome.CircuitOpen co) {
+            outcome.set(new Outcome(route.getRouteNo(), targetUpstream,
+                    UpstreamFailureKind.UPSTREAM_CIRCUIT_OPEN.errorCode(), groupName));
+            Map<String, String> extra = co.retryAfterMillis() > 0
+                    ? Map.of("Retry-After",
+                            String.valueOf(Math.max(1, (co.retryAfterMillis() + 999) / 1000)))
+                    : Map.of();
+            return GatewayErrors.write(exchange, objectMapper,
+                    UpstreamFailureKind.UPSTREAM_CIRCUIT_OPEN, traceId, null, extra);
+        }
+        Throwable err = ((com.apigw.proxy.resilience.ResilientForwarder.Outcome.Failed) res).error();
+        UpstreamFailureKind kind = UpstreamFailureKind.classify(err);
+        outcome.set(new Outcome(route.getRouteNo(), targetUpstream, kind.errorCode(), groupName));
+        return fail(exchange, traceId, kind, err);
     }
 
     /**

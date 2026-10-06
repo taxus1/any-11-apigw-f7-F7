@@ -271,6 +271,8 @@ public class RouteStore {
         public List<RuleDto> actions = new ArrayList<>();
         /** 灰度分组：旧配置 JSON 没这个字段时为 null，toDomain 按「无灰度」落，向后兼容。 */
         public List<GrayGroupDto> grayGroups;
+        /** 韧性策略（熔断/重试）：旧配置 JSON 没这个字段时为 null，toDomain 按「两者都不开」落。 */
+        public ResilienceDto resilience;
 
         static Dto from(GatewayRoute r) {
             Dto d = new Dto();
@@ -286,6 +288,7 @@ public class RouteStore {
             d.actions = r.getActions().stream().map(RuleDto::from).toList();
             d.grayGroups = r.getGrayGroups() == null ? List.of()
                     : r.getGrayGroups().stream().map(GrayGroupDto::from).toList();
+            d.resilience = r.getResilience() == null ? null : ResilienceDto.from(r.getResilience());
             return d;
         }
 
@@ -302,6 +305,8 @@ public class RouteStore {
             // 旧 JSON 缺字段（null）= 无灰度，全量流量回主上游
             r.replaceGrayGroups(
                     grayGroups == null ? List.of() : grayGroups.stream().map(GrayGroupDto::toDomain).toList());
+            // 韧性策略：旧 JSON 缺字段（null）= 熔断/重试都不开，走老链路
+            r.replaceResilience(resilience == null ? null : resilience.toDomain());
             r.getConditions().forEach(x -> x.setRuleKind(RuleTypes.KIND_CONDITION));
             r.getActions().forEach(x -> x.setRuleKind(RuleTypes.KIND_ACTION));
             return r;
@@ -352,6 +357,106 @@ public class RouteStore {
         GrayGroup toDomain() {
             return GrayGroup.create(groupName, upstream, weight,
                     tags == null ? List.of() : new ArrayList<>(tags));
+        }
+    }
+
+    /** 韧性策略（熔断 + 重试）在 Redis 里的形状：字段原样存取，校验在聚合层。 */
+    public static class ResilienceDto {
+        public Integer circuitBreakerEnabled;
+        public CircuitBreakerDto circuitBreaker;
+        public Integer retryEnabled;
+        public RetryDto retry;
+
+        static ResilienceDto from(com.apigw.domain.route.ResiliencePolicy p) {
+            ResilienceDto d = new ResilienceDto();
+            d.circuitBreakerEnabled = p.getCircuitBreakerEnabled();
+            d.retryEnabled = p.getRetryEnabled();
+            if (p.getCircuitBreaker() != null) {
+                d.circuitBreaker = CircuitBreakerDto.from(p.getCircuitBreaker());
+            }
+            if (p.getRetry() != null) {
+                d.retry = RetryDto.from(p.getRetry());
+            }
+            return d;
+        }
+
+        com.apigw.domain.route.ResiliencePolicy toDomain() {
+            var p = new com.apigw.domain.route.ResiliencePolicy();
+            p.setCircuitBreakerEnabled(circuitBreakerEnabled);
+            p.setRetryEnabled(retryEnabled);
+            if (circuitBreaker != null) {
+                p.setCircuitBreaker(circuitBreaker.toDomain());
+            }
+            if (retry != null) {
+                p.setRetry(retry.toDomain());
+            }
+            return p;
+        }
+    }
+
+    /** 熔断策略的存取形状。 */
+    public static class CircuitBreakerDto {
+        public Integer windowSize;
+        public Integer minimumNumberOfCalls;
+        public Integer failureRateThreshold;
+        public Integer minFailureCount;
+        public Long openWaitMs;
+        public Integer trialFraction;
+        public Integer successThreshold;
+
+        static CircuitBreakerDto from(com.apigw.domain.route.CircuitBreakerPolicy p) {
+            CircuitBreakerDto d = new CircuitBreakerDto();
+            d.windowSize = p.getWindowSize();
+            d.minimumNumberOfCalls = p.getMinimumNumberOfCalls();
+            d.failureRateThreshold = p.getFailureRateThreshold();
+            d.minFailureCount = p.getMinFailureCount();
+            d.openWaitMs = p.getOpenWaitMs();
+            d.trialFraction = p.getTrialFraction();
+            d.successThreshold = p.getSuccessThreshold();
+            return d;
+        }
+
+        com.apigw.domain.route.CircuitBreakerPolicy toDomain() {
+            var p = new com.apigw.domain.route.CircuitBreakerPolicy();
+            p.setWindowSize(windowSize);
+            p.setMinimumNumberOfCalls(minimumNumberOfCalls);
+            p.setFailureRateThreshold(failureRateThreshold);
+            p.setMinFailureCount(minFailureCount);
+            p.setOpenWaitMs(openWaitMs);
+            p.setTrialFraction(trialFraction);
+            p.setSuccessThreshold(successThreshold);
+            return p;
+        }
+    }
+
+    /** 重试策略的存取形状。 */
+    public static class RetryDto {
+        public Integer maxAttempts;
+        public Long backoffMs;
+        public Long totalTimeoutMs;
+        public List<String> idempotentMethods;
+        public String idempotencyKeyHeader;
+
+        static RetryDto from(com.apigw.domain.route.RetryPolicy p) {
+            RetryDto d = new RetryDto();
+            d.maxAttempts = p.getMaxAttempts();
+            d.backoffMs = p.getBackoffMs();
+            d.totalTimeoutMs = p.getTotalTimeoutMs();
+            d.idempotentMethods = p.getIdempotentMethods() == null
+                    ? List.of() : new ArrayList<>(p.getIdempotentMethods());
+            d.idempotencyKeyHeader = p.getIdempotencyKeyHeader();
+            return d;
+        }
+
+        com.apigw.domain.route.RetryPolicy toDomain() {
+            var p = new com.apigw.domain.route.RetryPolicy();
+            p.setMaxAttempts(maxAttempts);
+            p.setBackoffMs(backoffMs);
+            p.setTotalTimeoutMs(totalTimeoutMs);
+            p.setIdempotentMethods(idempotentMethods == null ? new ArrayList<>()
+                    : new ArrayList<>(idempotentMethods));
+            p.setIdempotencyKeyHeader(idempotencyKeyHeader);
+            return p;
         }
     }
 

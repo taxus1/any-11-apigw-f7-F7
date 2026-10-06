@@ -392,4 +392,89 @@ class GatewayRouteControllerWebTest {
                         org.assertj.core.api.Assertions.assertThat(v.toString())
                                 .contains("灰度分组第 2 条的上游地址"));
     }
+
+    // ---- 韧性（熔断/重试）配置进接口 ----
+
+    private Map<String, Object> resilienceBody(String routeNo, Map<String, Object> resilience) {
+        var m = body(routeNo, "n", "http://h:8080", null,
+                List.of(rule("PATH_PREFIX", null, "/a/", 1)), List.of());
+        if (resilience != null) {
+            m.put("resilience", resilience);
+        }
+        return m;
+    }
+
+    @Test
+    void create_withResilience_persistsAndEchoesBothPolicies() {
+        when(store.create(any())).thenAnswer(inv -> Mono.just(inv.getArgument(0)));
+
+        var cb = Map.<String, Object>of(
+                "windowSize", 30,
+                "minimumNumberOfCalls", 8,
+                "failureRateThreshold", 60,
+                "minFailureCount", 6,
+                "openWaitMs", 20000,
+                "trialFraction", 25,
+                "successThreshold", 2);
+        var rt = Map.<String, Object>of(
+                "maxAttempts", 3,
+                "backoffMs", 100,
+                "totalTimeoutMs", 9000,
+                "idempotentMethods", List.of("PUT", "DELETE"),
+                "idempotencyKeyHeader", "Idempotency-Key");
+        var resilience = Map.<String, Object>of(
+                "circuitBreakerEnabled", 1, "circuitBreaker", cb,
+                "retryEnabled", 1, "retry", rt);
+
+        web.post().uri("/api/gateway/routes")
+                .bodyValue(resilienceBody("res-01", resilience))
+                .exchange().expectBody()
+                .jsonPath("$.code").isEqualTo(0)
+                .jsonPath("$.data.resilience.circuitBreakerEnabled").isEqualTo(1)
+                .jsonPath("$.data.resilience.circuitBreaker.windowSize").isEqualTo(30)
+                .jsonPath("$.data.resilience.circuitBreaker.trialFraction").isEqualTo(25)
+                .jsonPath("$.data.resilience.retryEnabled").isEqualTo(1)
+                .jsonPath("$.data.resilience.retry.maxAttempts").isEqualTo(3)
+                .jsonPath("$.data.resilience.retry.idempotencyKeyHeader").isEqualTo("Idempotency-Key");
+    }
+
+    @Test
+    void create_resilienceDisabledByDefault_hasNoResilienceBlock() {
+        when(store.create(any())).thenAnswer(inv -> Mono.just(inv.getArgument(0)));
+        web.post().uri("/api/gateway/routes")
+                .bodyValue(resilienceBody("res-02", null))
+                .exchange().expectBody()
+                .jsonPath("$.code").isEqualTo(0)
+                .jsonPath("$.data.resilience").doesNotExist();
+    }
+
+    @Test
+    void create_badCircuitBreakerThreshold_rejected() {
+        var cb = Map.<String, Object>of("failureRateThreshold", 0);
+        var resilience = Map.<String, Object>of(
+                "circuitBreakerEnabled", 1, "circuitBreaker", cb,
+                "retryEnabled", 0);
+        web.post().uri("/api/gateway/routes")
+                .bodyValue(resilienceBody("res-03", resilience))
+                .exchange().expectBody()
+                .jsonPath("$.code").isEqualTo(1)
+                .jsonPath("$.msg").value(v ->
+                        org.assertj.core.api.Assertions.assertThat(v.toString())
+                                .contains("failureRateThreshold"));
+    }
+
+    @Test
+    void create_retryAttemptsTooLarge_rejected() {
+        var rt = Map.<String, Object>of("maxAttempts", 99);
+        var resilience = Map.<String, Object>of(
+                "circuitBreakerEnabled", 0,
+                "retryEnabled", 1, "retry", rt);
+        web.post().uri("/api/gateway/routes")
+                .bodyValue(resilienceBody("res-04", resilience))
+                .exchange().expectBody()
+                .jsonPath("$.code").isEqualTo(1)
+                .jsonPath("$.msg").value(v ->
+                        org.assertj.core.api.Assertions.assertThat(v.toString())
+                                .contains("maxAttempts"));
+    }
 }
