@@ -58,10 +58,20 @@ public class RouteStore {
 
     private final ReactiveStringRedisTemplate redis;
     private final ObjectMapper objectMapper;
+    private final RouteRevisionStore revisionStore;
 
-    public RouteStore(ReactiveStringRedisTemplate redis, ObjectMapper objectMapper) {
+    @org.springframework.beans.factory.annotation.Autowired
+    public RouteStore(ReactiveStringRedisTemplate redis,
+                      ObjectMapper objectMapper,
+                      RouteRevisionStore revisionStore) {
         this.redis = redis;
         this.objectMapper = objectMapper;
+        this.revisionStore = revisionStore;
+    }
+
+    /** 测试/兼容旧装配：不走全局 revision 协调时，仍可直接读写原 Hash。 */
+    public RouteStore(ReactiveStringRedisTemplate redis, ObjectMapper objectMapper) {
+        this(redis, objectMapper, null);
     }
 
     /** 读全部路由（含子项）。 */
@@ -85,7 +95,18 @@ public class RouteStore {
      */
     public Mono<GatewayRoute> create(GatewayRoute route) {
         route.setVersion(0);
-        return redis.opsForHash().putIfAbsent(ROUTES_KEY, route.getRouteNo(), serialize(route))
+        String json = serialize(route);
+        if (revisionStore != null) {
+            return revisionStore.commitCreate(route.getRouteNo(), json)
+                    .flatMap(result -> {
+                        if (!result.success()) {
+                            return Mono.error(toBizException(result));
+                        }
+                        route.setVersion(0);
+                        return Mono.just(route);
+                    });
+        }
+        return redis.opsForHash().putIfAbsent(ROUTES_KEY, route.getRouteNo(), json)
                 .flatMap(acquired -> Boolean.TRUE.equals(acquired)
                         ? Mono.just(route)
                         : Mono.error(new BizException(
@@ -102,10 +123,23 @@ public class RouteStore {
         Integer expectVersion = route.getVersion();
         if (expectVersion == null) {
             // 不允许「不带版本就改」，否则等于把乐观锁绕过去，静默覆盖别人的修改。
-            // 错误经 Mono 发出而非同步抛出：这是响应式契约，调用方的 onErrorResume 才接得住，
-            // 反应式链路上也不会突然冒一个同步异常出来
             return Mono.error(new BizException(
                     "修改必须带上读取时拿到的版本号 version（首版也要显式传 0），用于并发冲突检测"));
+        }
+        if (revisionStore != null) {
+            return findByRouteNo(route.getRouteNo())
+                    .switchIfEmpty(Mono.error(new BizException(404, "路由不存在：" + route.getRouteNo())))
+                    .flatMap(existing -> {
+                        if (!expectVersion.equals(existing.getVersion())) {
+                            return Mono.error(versionConflict(existing.getVersion(), expectVersion));
+                        }
+                        route.setId(existing.getId());
+                        route.setVersion(existing.getVersion() + 1);
+                        return revisionStore.commitUpdate(route.getRouteNo(), serialize(route), expectVersion)
+                                .flatMap(result -> result.success()
+                                        ? Mono.just(route)
+                                        : Mono.error(toBizException(result)));
+                    });
         }
         return withLock(route.getRouteNo(), () ->
                 findByRouteNo(route.getRouteNo())
@@ -127,6 +161,12 @@ public class RouteStore {
      * 带上 expectVersion 还能拦住「别人先改了、我手里还是旧版却来删」。
      */
     public Mono<Void> delete(String routeNo, Integer expectVersion) {
+        if (revisionStore != null) {
+            return revisionStore.commitDelete(routeNo, expectVersion)
+                    .flatMap(result -> result.success()
+                            ? Mono.empty()
+                            : Mono.error(toBizException(result)));
+        }
         return withLock(routeNo, () ->
                 findByRouteNo(routeNo)
                         .switchIfEmpty(Mono.error(new BizException(404,
@@ -137,6 +177,14 @@ public class RouteStore {
                             }
                             return redis.opsForHash().remove(ROUTES_KEY, routeNo).then();
                         }));
+    }
+
+    private BizException toBizException(RouteRevisionStore.CommitResult result) {
+        return new BizException(switch (result.code()) {
+            case 1, 2 -> result.code() == 2 ? 404 : 1;
+            case 3 -> 409;
+            default -> 1;
+        }, result.message());
     }
 
     private BizException versionConflict(int currentVersion, int expectVersion) {

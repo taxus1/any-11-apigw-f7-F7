@@ -32,7 +32,18 @@ apigw:
     response-timeout: 10s
     route-refresh-interval: 10s
     # 兜底轮询周期（毫秒），与上面的 Duration 保持一致；@Scheduled 只吃 long/字符串
-    route-refresh-interval-ms: 10000
+    route-refresh-interval-ms: 1000
+    route:
+      enabled: ${ROUTE_COORDINATION_ENABLED:false}
+      expected-instances: ${ROUTE_EXPECTED_INSTANCES:1}
+      instance-id: ${GATEWAY_INSTANCE_ID:${HOSTNAME:gateway-local}}
+      poll-interval: 1s
+      heartbeat-interval: 1s
+      heartbeat-ttl: 5s
+      prepare-timeout: 3s
+      fence-timeout: 800ms
+      gate-wait-timeout: 1s
+      snapshot-retention: 20
     # 灰度标记请求头：值大小写敏感、精确匹配（多空格/大小写不一致一律当没带，回落按权重分）。
     # 默认 X-Gray-Tag，可经环境变量改；标记优先级永远高于权重，详见 README「灰度发布」。
     gray:

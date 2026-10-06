@@ -16,6 +16,7 @@ import com.apigw.proxy.gray.GrayReleaseSelector;
 import com.apigw.proxy.gray.GrayTarget;
 import com.apigw.proxy.match.RouteMatcher;
 import com.apigw.proxy.route.RouteCatalog;
+import com.apigw.proxy.route.RouteSnapshot;
 import com.apigw.proxy.userauth.OutboundAuth;
 import com.apigw.proxy.userauth.UserAuthGatekeeper;
 import com.apigw.domain.userauth.UserTokenVerifier;
@@ -142,9 +143,9 @@ public class GatewayProxyWebFilter implements WebFilter, Ordered {
         exchange.getResponse().getHeaders().set(GatewayErrors.TRACE_HEADER, traceId);
         accessLog.logIncoming(traceId, method, path);
 
-        return routeCatalog.routes()
-                .flatMap(routes -> {
-                    GatewayRoute route = routeMatcher.match(routes, exchange.getRequest());
+        return routeCatalog.snapshot()
+                .flatMap((RouteSnapshot snapshot) -> {
+                    GatewayRoute route = routeMatcher.match(snapshot.routes(), exchange.getRequest());
                     if (route == null) {
                         outcome.set(new Outcome(null, null, "NO_ROUTE"));
                         return GatewayErrors.write(exchange, objectMapper,

@@ -144,9 +144,12 @@ bash tools/start-echo-upstream.sh   # 本地回显上游，8091（另开一个�
 
 ### 热刷新（不重启生效）
 
-- 管理接口增/删/改成功后发布进程内 `RoutesChangedEvent`，本实例的路由快照立即重载——新配路由**马上能走通**。
-- 另有 10s 定时兜底刷新（`apigw.proxy.route-refresh-interval`），多实例部署时别的实例改了配置，靠它在一个周期内收敛。
-- Redis 一时抖动：已有快照时沿用上一份继续转发，只在从没加载成功过时回 503。
+- 单实例兼容模式：管理接口增/删/改成功后发布进程内 `RoutesChangedEvent`，本实例的路由快照立即重载。
+- 三台集群模式（`ROUTE_COORDINATION_ENABLED=true`、`ROUTE_EXPECTED_INSTANCES=3`）：每次提交生成全局 revision 和不可变全量快照；三台先完整拉取并校验，再通过两阶段栅栏统一切换。
+- 感知方式为 Redis Pub/Sub 推送 + 1s 定时拉取兜底；正常通常 1s 内完成，推送丢失时最坏按 1s 轮询延迟发现，再叠加准备/栅栏耗时（默认 prepare 3s、fence 800ms）。
+- 任一实例拉取、校验、心跳或入栅栏失败，新版本不会激活，三台继续旧 active 快照转发；刷新失败不清空旧配置。
+- 切换时请求先在反应式 gate 短暂等待，已经拿到旧快照的在途请求继续旧配置到底，gate 放行后的请求统一使用新不可变快照。
+- 手动排障接口：`GET /api/gateway/route-coordination` 查看 active/latest revision、每台实例状态、checksum、上次加载和心跳时间；`POST /api/gateway/route-coordination/refresh` 强制重新协调；`POST /api/gateway/route-coordination/force-activate` 仅用于问题机器已确认摘流后的应急操作。
 
 ### 灰度发布（标记直达 + 按权重分流）
 
@@ -565,7 +568,7 @@ mvn test
 - 用户令牌目前只有「验」没有「发」：签发侧（登录服务）用同一把 `token-secret` 按 HS256 签 `sub`/`tenant`/`exp` 即可，网关不维护用户会话；令牌吊销/轮换密钥的接口留待后续。
 - 用户鉴权被拒（401）发生在匹配到路由之后，因此**会**进访问日志与流水（routeNo 已知）；这与第三方接入鉴权（在匹配前拒绝、不留流水）不同，是有意的——撞令牌的尝试需要留痕。
 - 管理接口（`/api/**`）本身未鉴权：`X-Created-By` 只是透传记录，接管理侧登录身份（谁能发凭据、改名单）是后续的题。
-- 多实例间的配置即时一致目前靠 10s 定时轮询兜底（本实例内是事件即时）；要做到跨实例秒级一致可接 Redis Pub/Sub。接入凭据/名单同理。
+- 路由多实例 revision 协调默认关闭（兼容单机旧行为）；三台部署需显式设置 `ROUTE_COORDINATION_ENABLED=true`、`ROUTE_EXPECTED_INSTANCES=3`。管理接口仍未鉴权，生产应把 `/api/gateway/route-coordination/**` 放到管理端口或接入管理侧登录鉴权。
 - 密钥目前只在创建时发放，没有「重新签发/轮换密钥」接口；遗失或泄露后需要时再加（数据模型已留散列字段，换发即覆盖）。
 - 鉴权被拒（401/403）的请求在匹配路由、转发之前就结束，因此不进 `gw_access_log` 流水表（也不产生文件式访问日志的 OUT 段）；若安全审计要统计「撞密钥/撞来路」的尝试，需要在鉴权过滤器内单独留一条拒绝审计。
 - 动作目前只支持请求/响应头的补与删；路径改写、查询串改写、体改写等留给后续。
