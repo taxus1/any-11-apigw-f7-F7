@@ -30,8 +30,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 @EnabledIfRedis
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestPropertySource(properties = {
-        "spring.data.redis.host=localhost",
-        "spring.data.redis.port=6379",
+        // Redis 地址不钉死：沿用 application-dev.yml 的 ${REDIS_HOST:localhost} 环境变量口径，
+        // 与 RedisAvailableCondition 探测的是同一台，避免「条件说能连、应用连的是另一台」
         "logging.level.com.apigw=warn"
 })
 class GatewayRouteControllerIT {
@@ -278,12 +278,17 @@ class GatewayRouteControllerIT {
         web.get().uri("/api/gateway/routes?keyword=分页").exchange().expectBody()
                 .jsonPath("$.data.total").isEqualTo(5);
 
-        // pageSize 超过上限被压到 200，且计数带在每行上
+        // pageSize 超过上限被压到 200，且计数带在每行上。
+        // 行序按编号字典序：other-99 在最前（1 条件、0 动作），p-01 紧随其后（1 条件、1 动作）
         web.get().uri("/api/gateway/routes?pageSize=99999").exchange().expectBody()
                 .jsonPath("$.data.pageSize").isEqualTo(200)
                 .jsonPath("$.data.total").isEqualTo(6)
-                .jsonPath("$.data.content[0].conditionCount").isNumber()
-                .jsonPath("$.data.content[0].actionCount").isEqualTo(1);
+                .jsonPath("$.data.content[0].routeNo").isEqualTo("other-99")
+                .jsonPath("$.data.content[0].conditionCount").isEqualTo(1)
+                .jsonPath("$.data.content[0].actionCount").isEqualTo(0)
+                .jsonPath("$.data.content[1].routeNo").isEqualTo("p-01")
+                .jsonPath("$.data.content[1].conditionCount").isEqualTo(1)
+                .jsonPath("$.data.content[1].actionCount").isEqualTo(1);
     }
 
     @Test
@@ -306,5 +311,31 @@ class GatewayRouteControllerIT {
         // Redis 里整条 field 消失，条件/动作没有独立 key，无孤儿可留
         Boolean exists = redis.opsForHash().hasKey(RouteStore.ROUTES_KEY, "del-01").block();
         assertEquals(false, exists);
+    }
+
+    @Test
+    void delete_thenRecreateSameRouteNo_newRouteIsNotContaminated() {
+        // 老路由：2 条件 + 1 动作，指 order 上游
+        createRoute(routeBody("re-01", "老路由", "http://order-svc:8080", 1, null,
+                List.of(rule("PATH_PREFIX", null, "/order/", 1), rule("METHOD", null, "GET", 2)),
+                List.of(rule("REQ_ADD_HEADER", "X-Legacy", "1", 1)))).jsonPath("$.code").isEqualTo(0);
+        web.delete().uri("/api/gateway/routes/re-01").exchange()
+                .expectBody().jsonPath("$.code").isEqualTo(0);
+
+        // 同编号重建：1 条件 + 1 动作，指 pay 上游
+        createRoute(routeBody("re-01", "新路由", "http://pay-svc:9090", 1, null,
+                List.of(rule("PATH_PREFIX", null, "/pay/", 1)),
+                List.of(rule("REQ_REMOVE_HEADER", "X-Old", null, 1)))).jsonPath("$.code").isEqualTo(0);
+
+        // 详情必须恰好是新建那一批：老的条件/动作一个都不许混进来
+        web.get().uri("/api/gateway/routes/re-01").exchange().expectBody()
+                .jsonPath("$.code").isEqualTo(0)
+                .jsonPath("$.data.name").isEqualTo("新路由")
+                .jsonPath("$.data.upstream").isEqualTo("http://pay-svc:9090")
+                .jsonPath("$.data.version").isEqualTo(0)
+                .jsonPath("$.data.conditions.length()").isEqualTo(1)
+                .jsonPath("$.data.conditions[0].value").isEqualTo("/pay/")
+                .jsonPath("$.data.actions.length()").isEqualTo(1)
+                .jsonPath("$.data.actions[0].type").isEqualTo("REQ_REMOVE_HEADER");
     }
 }

@@ -25,6 +25,7 @@ bash tools/start-echo-upstream.sh   # 本地回显上游，8091（另开一个�
 | GET | `/api/gateway/routes/{routeNo}` | 路由详情（含全部子项，按顺序号排好） |
 | GET | `/api/gateway/routes?pageNum=&pageSize=&keyword=` | 分页列表（每条带条件/动作计数） |
 | DELETE | `/api/gateway/routes/{routeNo}?expectVersion=` | 删除路由（整树清掉） |
+| POST | `/api/gateway/routes/_explain` | 排查：算一条请求落到哪条路由、为什么（见「匹配排查」） |
 | GET | `/api/gateway/access-logs?startTime=&endTime=&routeNo=&statusCode=&pageNum=&pageSize=` | 按条件翻访问流水（时间必填，见「翻流水」） |
 
 所有接口返回统一结构 `{ code, msg, data }`：
@@ -61,7 +62,7 @@ bash tools/start-echo-upstream.sh   # 本地回显上游，8091（另开一个�
 }
 ```
 
-- 路由编号：业务唯一，建后**不可改**（PUT 的 body 里编号与路径不一致会被拦）；停用的路由也占号，只有删除才释放编号。
+- 路由编号：业务唯一，建后**不可改**（PUT 的 body 里编号与路径不一致会被拦）；停用的路由也占号，只有删除才释放编号。删除是整树清掉（路由连同它的全部条件、动作一次删净，库里没有无主子项）；删完用同一编号重建的是一条全新路由（版本从 0 重新计、内部 id 新分配），不会冒出上一任的任何子项。
 - `authRequired` 登录开关跟着路由走：`1` = 需登录（调用方必须带网关验得过的用户令牌，见「用户登录鉴权与身份透传」），`0`/不传 = 开放（谁都能打）。只认 0/1，别的值报「登录开关只能是 0（开放）或 1（需登录）」。
 - 匹配条件只认 `PATH_PREFIX` / `METHOD` / `HEADER` / `QUERY`；路径、方法两类不用填 `name`。
 - 转发动作只认 `REQ_ADD_HEADER` / `REQ_REMOVE_HEADER` / `RESP_ADD_HEADER` / `RESP_REMOVE_HEADER`；删头不用填 `value`。
@@ -107,7 +108,7 @@ bash tools/start-echo-upstream.sh   # 本地回显上游，8091（另开一个�
 
 ### 匹配细节
 
-- 同一条路由上的条件是 **AND**，任何一条不满足就不命中。
+- 同一条路由上的条件是 **AND**，任何一条不满足就不命中；同一批条件怎么排列结果都一样（顺序无语义）。
 - **路径前缀边界**（最容易踩的点）：
   - 规则 `/order/`（带尾斜杠）= 只认子树：命中 `/order/abc`、`/order/`，但**不**命中 `/order` 本身；
   - 规则 `/order`（不带尾斜杠）= 精确路径 + 子树：命中 `/order`、`/order/abc`，但**不**命中 `/other`、`/ordering`、`/order-x`、`/orders/1`（下一个字符必须是 `/`）。
@@ -118,6 +119,36 @@ bash tools/start-echo-upstream.sh   # 本地回显上游，8091（另开一个�
   2. 仍并列时条件总数更多的赢（约束更具体）；
   3. 还并列按路由编号字典序（routeNo 只含字母数字 `. _ -`）。
 - 停用的、以及一条条件都没有的路由不参与匹配。
+
+### 匹配排查（这条请求会落到哪条路由）
+
+线上出现「这条请求怎么走到那条路由去了 / 怎么 404 了」时，不用猜：
+
+```bash
+curl -X POST http://localhost:8080/api/gateway/routes/_explain \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "path": "/order/api/users",
+        "method": "GET",
+        "headers": { "X-Caller": "web" },
+        "query":   { "from": "cart" }
+      }'
+```
+
+- 评估用的是**转发链路此刻正在生效的那份路由快照**（返回里带 `snapshotRevision`），
+  不是另查一份库里的新配置——算出来的落点就是同一个请求现在打进来会走的落点。
+- 返回里每条参与匹配的路由一段：逐条件给出「期望值 / 实际值 / 是否满足 / 原因」，
+  全部条件命中的按定序规则排出名次（`rank`）：
+  - `WINNER`：最终落点（`routeNo` / `upstream` 在响应顶层）；
+  - `LOST_PRECEDENCE`：条件也全中，但被更靠前的路由抢走，`note` 写明被谁、
+    因为哪一级定序规则（前缀更短 / 条件数更少 / 编号字典序靠后）；
+  - `CONDITION_FAILED`：第一条不满足的条件及原因（如「方法期望 POST，实际 GET」、
+    「URL 查询串里没有 from 参数」）。
+- 停用、没配条件、或还没发布进生效快照的路由列在 `excluded` 里并带原因，
+  不会混在候选里造成「我配的路由怎么没出现」的困惑。
+- 一条都没命中也是 `code=0` 的正常结论（`matched=false`，对应线上 404 NO_ROUTE）；
+  只有请求描述本身不像样（路径为空、路径不带 `/`、方法为空）才回业务失败。
+- 只读接口，不改任何配置；`query` 认的是 URL 查询串，与请求体无关。
 
 ### 动作语义
 

@@ -14,6 +14,7 @@ import java.util.Locale;
  * 路由匹配：拿一份「当前启用、可匹配」的路由快照，对一个请求找出唯一命中的路由。
  *
  * 命中规则：同一条路由上的全部匹配条件是 AND，任何一条不满足就不命中；
+ * 条件之间没有顺序语义——同一批条件怎么排列，命中与否都一样（AND 天然与顺序无关）。
  * 多条路由同时命中时，按下列确定次序选出唯一一条（同样的请求永远走同一条，不会漂移）：
  *   1. PATH_PREFIX 前缀更长的优先（更具体的路径赢；没写路径条件的按 0 长度排最后）；
  *   2. 仍并列（如路径条件相同、或都没路径条件）时，条件总数更多的赢（约束更具体）；
@@ -23,8 +24,11 @@ import java.util.Locale;
  * - PATH_PREFIX：见 {@link PathPrefixMatcher}，按常规 URL 语义路径大小写敏感；
  * - METHOD：HTTP 方法名大小写不敏感（GET 与 get 等价），比较时统一大写；
  * - HEADER：头名大小写不敏感（HTTP 头本来就不区分大小写），头值大小写敏感、精确相等；
- * - QUERY：参数名大小写敏感，参数值大小写敏感、精确相等（只判断该参数是否带着这个值）。
+ * - QUERY：参数名大小写敏感，参数值大小写敏感、精确相等（只判断该参数是否带着这个值），
+ *   认的是 URL 查询串，请求体里的同名字段不算。
  *
+ * 判定只依赖 {@link MatchInput}：转发链路从真实请求提取，排查接口从手工描述构造，
+ * 两处共用这一份逻辑，保证排查结果与线上行为一致。
  * 这类不持有状态、不碰 Redis，快照由上层 RouteCatalog 提供，方便直接单测。
  */
 @Component
@@ -43,9 +47,14 @@ public class RouteMatcher {
      * 返回唯一命中的路由；一条都不命中返回 null（上层据此回 404 NO_ROUTE）。
      */
     public GatewayRoute match(List<GatewayRoute> routes, ServerHttpRequest request) {
+        return match(routes, MatchInput.from(request));
+    }
+
+    /** 同 {@link #match(List, ServerHttpRequest)}，输入是已归一化的请求特征。 */
+    public GatewayRoute match(List<GatewayRoute> routes, MatchInput input) {
         GatewayRoute best = null;
         for (GatewayRoute route : routes) {
-            if (!allConditionsMatch(route, request)) {
+            if (!allConditionsMatch(route, input)) {
                 continue;
             }
             if (best == null || PRECEDENCE.compare(route, best) < 0) {
@@ -56,31 +65,32 @@ public class RouteMatcher {
     }
 
     /** 一条路由的全部条件 AND。 */
-    private boolean allConditionsMatch(GatewayRoute route, ServerHttpRequest request) {
+    boolean allConditionsMatch(GatewayRoute route, MatchInput input) {
         for (GatewayRule c : route.getConditions()) {
-            if (!conditionMatches(c, request)) {
+            if (!conditionMatches(c, input)) {
                 return false;
             }
         }
         return true;
     }
 
-    private boolean conditionMatches(GatewayRule c, ServerHttpRequest request) {
+    /** 单条条件判定（包内可见：排查解释器复用同一份语义，不另起炉灶）。 */
+    boolean conditionMatches(GatewayRule c, MatchInput input) {
         switch (c.getType()) {
             case RuleTypes.TYPE_PATH_PREFIX -> {
-                return PathPrefixMatcher.matches(c.getValue(), request.getPath().pathWithinApplication().value());
+                return PathPrefixMatcher.matches(c.getValue(), input.path());
             }
             case RuleTypes.TYPE_METHOD -> {
                 // 方法名是大小写不敏感的 token
-                return request.getMethod() != null
-                        && c.getValue().equalsIgnoreCase(request.getMethod().name());
+                return !input.method().isEmpty()
+                        && c.getValue().equalsIgnoreCase(input.method());
             }
             case RuleTypes.TYPE_HEADER -> {
-                String actual = request.getHeaders().getFirst(c.getName());
+                String actual = input.firstHeader(c.getName());
                 return actual != null && actual.equals(c.getValue());
             }
             case RuleTypes.TYPE_QUERY -> {
-                List<String> values = request.getQueryParams().get(c.getName());
+                List<String> values = input.queryValues(c.getName());
                 return values != null && values.contains(c.getValue());
             }
             default -> {
@@ -91,7 +101,7 @@ public class RouteMatcher {
     }
 
     /** 取路由上路径前缀条件的前缀长度（多条时取最长）；没有路径条件返回 0。 */
-    private static int pathPrefixLength(GatewayRoute route) {
+    static int pathPrefixLength(GatewayRoute route) {
         int len = 0;
         for (GatewayRule c : route.getConditions()) {
             if (RuleTypes.TYPE_PATH_PREFIX.equals(c.getType()) && c.getValue() != null) {

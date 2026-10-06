@@ -190,6 +190,36 @@ class RouteStoreTest {
     }
 
     @Test
+    void delete_thenRecreateSameRouteNo_startsClean_noLeftoverChildren() {
+        // 老路由：2 条件 + 2 动作
+        GatewayRoute old = route("re-01", 0);
+        String oldId = old.getId();
+        store.create(old).block();
+        store.delete("re-01", 0).block();
+
+        // 同编号重建：只带 1 条件 + 1 动作，内容完全不同
+        GatewayRoute fresh = GatewayRoute.create("re-01", "重建", "http://pay-svc:9090", 1, null);
+        fresh.setId("new-id-re-01");
+        fresh.replaceRules(
+                List.of(GatewayRule.create(null, RuleTypes.TYPE_PATH_PREFIX, null, "/pay/", 1)),
+                List.of(GatewayRule.create(null, RuleTypes.TYPE_REQ_REMOVE_HEADER, "X-Old", null, 1)));
+        store.create(fresh).block();
+
+        GatewayRoute got = store.findByRouteNo("re-01").block();
+        assertNotNull(got);
+        // 老的条件/动作一条都不许冒出来：读回的必须恰好是新建那一批
+        assertEquals(1, got.getConditions().size());
+        assertEquals("/pay/", got.getConditions().get(0).getValue());
+        assertEquals(1, got.getActions().size());
+        assertEquals("X-Old", got.getActions().get(0).getName());
+        assertEquals("http://pay-svc:9090", got.getUpstream());
+        // 版本从 0 重新计，id 是新分配的那个，与老路由没有任何瓜葛
+        assertEquals(0, got.getVersion());
+        assertEquals("new-id-re-01", got.getId());
+        assertTrue(oldId == null || !oldId.equals(got.getId()));
+    }
+
+    @Test
     void delete_notExists_reports404_notSilentSuccess() {
         StepVerifier.create(store.delete("ghost", null))
                 .expectErrorSatisfies(e -> {

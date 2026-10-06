@@ -35,8 +35,8 @@ import java.util.Map;
 @EnabledIfRedis
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestPropertySource(properties = {
-        "spring.data.redis.host=localhost",
-        "spring.data.redis.port=6379",
+        // Redis 地址不钉死：沿用 application-dev.yml 的 ${REDIS_HOST:localhost} 环境变量口径，
+        // 与 RedisAvailableCondition 探测的是同一台
         "logging.level.com.apigw=warn",
         "apigw.proxy.response-timeout=5s"
 })

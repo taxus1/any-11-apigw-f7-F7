@@ -135,6 +135,24 @@ class RouteMatcherTest {
     }
 
     @Test
+    void conditionOrderWithinRoute_doesNotChangeOutcome() {
+        // 同一条路由的条件是 AND：同一批条件换个顺序，命中与否必须一样
+        GatewayRoute ordered = route("r", "http://h:1", List.of(
+                path("/order/", 1), method("GET", 2), header("X-Caller", "web", 3), query("from", "cart", 4)));
+        GatewayRoute shuffled = route("r", "http://h:1", List.of(
+                query("from", "cart", 4), header("X-Caller", "web", 3), method("GET", 2), path("/order/", 1)));
+
+        var hit = MockServerHttpRequest.get("/order/abc?from=cart").header("X-Caller", "web").build();
+        var miss = MockServerHttpRequest.get("/order/abc?from=buy").header("X-Caller", "web").build();
+        for (var req : List.of(hit, miss)) {
+            GatewayRoute a = matcher.match(List.of(ordered), req);
+            GatewayRoute b = matcher.match(List.of(shuffled), req);
+            assertEquals(a == null ? null : a.getRouteNo(), b == null ? null : b.getRouteNo(),
+                    "同批条件换顺序，命中结果不能变");
+        }
+    }
+
+    @Test
     void noMatchReturnsNull() {
         GatewayRoute r = route("r", "http://h:1", List.of(path("/order/", 1)));
         assertNull(matcher.match(List.of(r), request("GET", "/other")));
